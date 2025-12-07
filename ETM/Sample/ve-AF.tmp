@@ -1,0 +1,883 @@
+//#include <OgreNoMemoryMacros.h>
+#include <CEGUI/CEGUISystem.h>
+#include <CEGUI/CEGUISchemeManager.h>
+#include <OgreCEGUIRenderer.h>
+
+#include "ExampleApplication.h"
+
+#include "ETTerrainManager.h"
+#include "ETTerrainInfo.h"
+#include "ETBrush.h"
+#include "ETSplattingManager.h"
+
+#include "Configer.h"
+
+using namespace std;
+using Ogre::uint;
+
+#include "TinyXml/tinyxml.h"
+#include "tinyxml/tinystr.h"
+
+static bool IsStrEqual( const char* str1, const char* str2 )
+{
+	return ( strcmp( str1, str2) == 0 )?true:false; 
+}
+
+struct PixMap
+{
+	float left;
+	float right;
+	float top;
+	float bottom;
+	int id;
+};
+
+
+void FixFloat( float& f )
+{
+	if( f > -0.01f && f < 0.01f )
+		f = 0.0f;
+	
+	else if( f > 0.024f && f < 0.026f )
+		f = 0.025f;
+
+	else if( f > 0.074f && f < 0.076f )
+		f = 0.075f;
+
+	else if( f > 0.99f && f < 1.01f )
+		f = 1.00f;
+}
+
+void AddImageIntoTexture( Ogre::TexturePtr pTexture, int row, int col, int rowSize, const Ogre::Image& image )
+{
+	const int gridSize = 256;
+	HardwarePixelBufferSharedPtr pixptr= pTexture->getBuffer();
+	pixptr->lock( HardwareBuffer::HBL_DISCARD );
+	const PixelBox &pb = pixptr->getCurrentLock();
+	uchar* dstData = static_cast<uchar*>( pb.data );
+	const uchar *srcData = image.getData();
+
+	size_t pitch = pb.rowPitch; // Skip between rows of image
+
+	size_t dst_bpp = 4; // RGBA
+	size_t src_bpp = Ogre::PixelUtil::getNumElemBytes(  image.getFormat() );
+
+	size_t srcPitch = image.getRowSpan();
+	size_t dstPitch = pitch * dst_bpp;
+
+	for(size_t i = row*rowSize*gridSize ; i < row*rowSize*gridSize+gridSize; i++)
+	{
+		for(size_t j = col*gridSize; j < col*gridSize+gridSize; j++)
+		{
+			memcpy( dstData+( i * dstPitch ) + j*dst_bpp , srcData + i*srcPitch+ j*src_bpp, src_bpp );
+			if( src_bpp < dst_bpp )
+				dstData[i*dstPitch+j*dst_bpp+3] = 255;	// alpha
+		}
+	}
+	pixptr->unlock();
+}
+
+void AddImageFragmentIntoLayer( Ogre::TexturePtr layer, int index, int rowSize, const Ogre::Image& pImage, PixMap& pixmap )
+{
+	const int sizePerGrid = 64;
+	int x = index%rowSize;
+	int y = index/rowSize;
+
+	HardwarePixelBufferSharedPtr pixptr= layer->getBuffer();
+	pixptr->lock( HardwareBuffer::HBL_DISCARD );
+	const PixelBox &pb = pixptr->getCurrentLock();
+	uchar* dstData = static_cast<uchar*>( pb.data );
+	size_t height = pb.getHeight();
+	size_t width = pb.getWidth();
+	size_t pitch = pb.rowPitch; // Skip between rows of image
+	
+	FixFloat( pixmap.left );
+	FixFloat( pixmap.right );
+	FixFloat( pixmap.top );
+	FixFloat( pixmap.bottom );
+
+	int left = pImage.getWidth()*pixmap.left;
+	int right = pImage.getWidth()*pixmap.right;
+	int top = pImage.getHeight()*pixmap.top;
+	int bottom = pImage.getHeight()*pixmap.bottom;
+
+	size_t dst_bpp = 4; // RGBA
+	size_t src_bpp = Ogre::PixelUtil::getNumElemBytes(  pImage.getFormat() );
+
+	const unsigned char *srcData = pImage.getData();
+
+	size_t srcPitch = pImage.getRowSpan();
+	size_t dstPitch = pitch * dst_bpp;
+	
+	int x_start, x_end,y_start, y_end;
+	if( left > right ) {
+		x_start = right;
+		x_end = left;
+	}
+	else {
+		x_start = left;
+		x_end = right;
+	}
+
+	if( top > bottom ){
+		y_start = bottom;
+		y_end = top;
+	}
+	else {
+		y_start = top;
+		y_end = bottom;
+	} 
+
+	int imageCol = y_start;
+	int imageRow = x_start;
+	for(size_t row = y*rowSize*sizePerGrid ; row <y*rowSize*sizePerGrid+sizePerGrid; row++)
+	{
+		imageRow = 0;
+		for(size_t col = x*sizePerGrid; col < x*sizePerGrid+sizePerGrid; col++)
+		{
+			memcpy( dstData+( row * dstPitch ) + col*dst_bpp , srcData+ imageRow*srcPitch+ imageCol*src_bpp, src_bpp );
+			if( src_bpp < dst_bpp )
+				dstData[row*dstPitch+col*dst_bpp+3] = 255;
+	
+			imageRow++;
+		}
+		imageCol++;
+	}
+
+	pixptr->unlock();
+}
+
+
+char * UnicodeToANSI( const wchar_t* str )
+{
+	char* result;
+	int textlen;
+	textlen = WideCharToMultiByte( CP_ACP, 0, str, -1, NULL, 0, NULL, NULL );
+	result =(char *)malloc((textlen+1)*sizeof(char));
+	memset( result, 0, sizeof(char) * ( textlen + 1 ) );
+	WideCharToMultiByte( CP_ACP, 0, str, -1, result, textlen, NULL, NULL );
+	return result;
+}
+
+
+wchar_t * UTF8ToUnicode( const char* str )
+{
+	int textlen ;
+	wchar_t * result;
+	textlen = MultiByteToWideChar( CP_UTF8, 0, str,-1, NULL,0 );  
+	result = (wchar_t *)malloc((textlen+1)*sizeof(wchar_t));  
+	memset(result,0,(textlen+1)*sizeof(wchar_t));  
+	MultiByteToWideChar(CP_UTF8, 0,str,-1,(LPWSTR)result,textlen );  
+	return result;  
+}
+
+
+char* UTF8ToANSI(const char* str)
+{	
+	wchar_t* temp = UTF8ToUnicode(str);
+	char* res = UnicodeToANSI(temp);
+	delete []temp;
+	return res;
+}
+
+void CreateTTLBLayer( const char* sceneName )
+{
+	// 读取.Terrain 文件
+	// 读取 GridInfo 文件
+	// 手动创建<layer0> <layer1> 
+	// 通过Terrain和GridInfo的信息
+	TiXmlDocument terrainDoc;
+
+	Configer reader( "TOW.cfg" );
+	bool bLoadSuccess = terrainDoc.LoadFile( reader.getStr( "SceneFileDir") + String( sceneName ) + ".Terrain" );
+	vector<Ogre::Image > imageArray;
+	vector<PixMap> pixMapArray;
+
+	if( !bLoadSuccess ) {
+		OGRE_EXCEPT(Exception::ERR_INVALID_STATE, "load terrain file failed", "");
+		return;
+	}
+
+	
+	TiXmlElement* root = terrainDoc.FirstChildElement(); 
+	int width,height,tile_size;
+	root->QueryIntAttribute( "xsize", &width );
+	root->QueryIntAttribute( "zsize", &height);
+	root->QueryIntAttribute( "tileSize", &tile_size );
+
+	const int sizePerGrid = 64;
+	TexturePtr layer0TexturePtr = TextureManager::getSingletonPtr()->createManual( 
+		"<layer0>", "General",TEX_TYPE_2D,sizePerGrid*width,sizePerGrid*height,1, PF_BYTE_RGBA );
+
+	TexturePtr layer1TexturePtr = TextureManager::getSingletonPtr()->createManual( 
+		"<layer1>", "General",TEX_TYPE_2D,sizePerGrid*width,sizePerGrid*height,1, PF_BYTE_RGBA );
+
+	const char* elementValue;
+
+	// scale
+	TiXmlElement* element = root->FirstChildElement( "scale");
+	int scale_x,scale_y,scale_z;
+	
+	element->QueryIntAttribute( "x", &scale_x );
+	element->QueryIntAttribute( "y", &scale_y );
+	element->QueryIntAttribute( "z", &scale_z );
+	
+	// gridinfo
+	element = root->FirstChildElement( "gridInfo" );
+	const char* gridInfoFileName = element->Attribute( "filename" );
+	const char* gridInfoType = element->Attribute( "type");
+
+	// textures
+	element = root->FirstChildElement( "textures");
+
+	TiXmlElement* pTxtureElement = element->FirstChildElement();
+	while( pTxtureElement )
+	{
+		elementValue = pTxtureElement->Attribute( "type");
+		{	
+			if( IsStrEqual( "image", elementValue ) )
+			{
+				elementValue = pTxtureElement->Attribute( "filename");
+				elementValue = UTF8ToANSI( elementValue );
+				Ogre::Image image;
+				image.load( elementValue,"General" );
+				delete[] elementValue;
+				imageArray.push_back( image );
+			}
+			else 
+			{
+				OGRE_EXCEPT(Exception::ERR_INVALID_STATE, "unknown type of textures", "");
+			}
+			pTxtureElement = pTxtureElement->NextSiblingElement();
+		}
+	}
+
+	element = root->FirstChildElement( "pixmaps");
+
+	TiXmlElement* pPixmapElement = element->FirstChildElement();
+	while( pPixmapElement )
+	{
+		PixMap pixmap;
+		pPixmapElement->QueryFloatAttribute( "top", &pixmap.top );
+		pPixmapElement->QueryFloatAttribute( "bottom", &pixmap.bottom );
+		pPixmapElement->QueryFloatAttribute( "left", &pixmap.left);
+		pPixmapElement->QueryFloatAttribute( "right", &pixmap.right );
+		pPixmapElement->QueryIntAttribute( "textureId", &pixmap.id	);
+		
+		pixMapArray.push_back( pixmap );
+
+		pPixmapElement = pPixmapElement->NextSiblingElement();
+	}
+	
+
+	//--------------------------------------------------------------------
+	// gridinfo
+
+	FILE* pf = fopen(  ( reader.getStr( "SceneFileDir")+ gridInfoFileName ).c_str() , "rb" );
+	fseek( pf, 8, SEEK_SET );
+
+	int size_x;
+	int size_y;
+	fread( &size_x, 4,1, pf );
+	fread( &size_y, 4,1, pf );
+
+	uchar op1,op0;
+	uchar layer1,layer0;
+	uchar tr;
+	
+	for( int i = 0 ; i < size_x*size_y; ++i )
+	{
+		fread( &op0, 1,1, pf );
+		fread( &layer0,1,1, pf );
+		fread( &op1, 1,1,pf );
+		fread( &layer1, 1,1,pf );
+		fread( &tr, 1,1,pf );
+	
+		if( layer0 > 0 ) {
+			PixMap p = pixMapArray[layer0-1];
+			AddImageFragmentIntoLayer( layer0TexturePtr, i, size_x, imageArray[p.id], p );
+		
+		}
+		if( layer1 > 0 ){
+			PixMap p = pixMapArray[layer1-1];
+			AddImageFragmentIntoLayer( layer1TexturePtr, i,size_x, imageArray[p.id], p );
+		}
+ 		
+		if( i > size_x*size_y-size_x )
+			break;
+	}
+	fclose( pf );
+
+
+}
+
+
+class DemoListener : public ExampleFrameListener, public OIS::MouseListener, public OIS::KeyListener
+{
+public:
+
+  DemoListener(RenderWindow* win, Camera* cam, SceneManager *sceneManager, CEGUI::Renderer *renderer, ET::TerrainManager* terrainMgr, ET::SplattingManager* splatMgr)
+    : ExampleFrameListener(win, cam, true, true), mGUIRenderer(renderer), mTerrainMgr(terrainMgr), mTerrainInfo(&terrainMgr->getTerrainInfo()), mSplatMgr(splatMgr)
+    {
+      // Setup default variables
+      mPointer = NULL;
+      mLMouseDown = false;
+      mRMouseDown = false;
+      mMMouseDown = false;
+      mSceneMgr = sceneManager;
+
+      // Reduce move speed
+      mMoveSpeed = 320;
+      mRotateSpeed *= 0.008;
+
+      // Register this so that we get events.
+      mMouse->setEventCallback( this );
+      mKeyboard->setEventCallback(this);
+
+      // Create RaySceneQuery
+      mRaySceneQuery = mSceneMgr->createRayQuery( Ray() );
+
+      // Create a "pointer" for use on the terrain
+      Entity* pointer = mSceneMgr->createEntity("Pointer", "ogrehead.mesh");
+      mPointer = mSceneMgr->getRootSceneNode()->createChildSceneNode();
+      //mPointer->attachObject(pointer);
+
+      // initialise CEGUI mouse cursor position
+      CEGUI::MouseCursor::getSingleton().setPosition(CEGUI::Point(CEGUI::Vector2(0,0)));
+
+      createEditBrush();
+      mDeform = true;
+      mChosenTexture = 0;
+
+      mDirection = Vector3::ZERO;
+
+      mContinue = true;
+
+      mCamNode = mCamera->getParentSceneNode();
+    }
+
+    ~DemoListener( )
+    {
+      delete mRaySceneQuery;
+    }
+
+
+    void createEditBrush()
+    {
+      // load the edit brush for terrain editing
+      Image image;
+      image.load("brush.png", "ET");
+      image.resize(16, 16);
+      mEditBrush = ET::loadBrushFromImage(image);
+    }
+
+
+    bool frameStarted(const FrameEvent &evt)
+    {
+      if (!ExampleFrameListener::frameStarted( evt ))
+        return false;
+
+      // handle movement
+      mCamNode->translate(mCamera->getOrientation()*mDirection*mMoveSpeed*evt.timeSinceLastFrame);
+
+      // Ensure we stay above terrain (somehow buggy still, doesn't work reliably)
+      Vector3 camPos = mCamNode->getPosition( );
+      // get terrain height at camPos
+      float terrainHeight = mTerrainInfo->getHeightAt(camPos.x, camPos.z);
+      if ((terrainHeight + 30.0f) > camPos.y)
+        mCamNode->setPosition(camPos.x, terrainHeight+30.0f, camPos.z);
+
+      if (mLMouseDown || mRMouseDown)
+      {
+        // deform or paint terrain on mouse down
+        // left button raises, right button lowers
+        if (mDeform)
+        {
+          // choose a brush intensity, this determines
+          // how extreme our brush works on the terrain
+          float brushIntensity = evt.timeSinceLastFrame * 0.4 * (mLMouseDown? 1 : -1);
+          // translate our cursor position to vertex indexes
+          Vector3 deformPos = mPointer->getPosition();
+          int x = mTerrainInfo->posToVertexX(deformPos.x);
+          int z = mTerrainInfo->posToVertexZ(deformPos.z);
+          // now tell the ETM to deform the terrain
+          mTerrainMgr->deform(x, z, mEditBrush, brushIntensity);
+        }
+        else
+        {
+          // need to set our brush intensity larger for painting.
+          // for painting, all texture channels are only 1 byte
+          // large, so with a small intensity you won't get any
+          // effect at all.
+          float brushIntensity = evt.timeSinceLastFrame * 5.0 * (mLMouseDown? 1 : -1);
+          // retrieve edit points
+          Vector3 paintPos = mPointer->getPosition();
+          int x = mTerrainInfo->posToVertexX(paintPos.x);
+          int z = mTerrainInfo->posToVertexZ(paintPos.z);
+          // now use the splatting manager to update the coverage maps
+          mSplatMgr->paint(mChosenTexture, x, z, mEditBrush, brushIntensity);
+        }
+      }
+      return mContinue;
+    }
+
+
+   virtual bool mousePressed( const OIS::MouseEvent &arg, OIS::MouseButtonID id )
+   {
+     // Left mouse button down
+     if ( id == OIS::MB_Left )
+     {
+       mLMouseDown = true;
+     }
+     // Middle mouse button down
+     else if ( id == OIS::MB_Middle )
+     {
+       CEGUI::MouseCursor::getSingleton().hide( );
+       mMMouseDown = true;
+     }
+
+     else if (id == OIS::MB_Right)
+     {
+       mRMouseDown = true;
+     }
+
+     return true;
+   }
+
+   virtual bool mouseReleased( const OIS::MouseEvent &arg, OIS::MouseButtonID id )
+   {
+     // Left mouse button up
+     if ( id == OIS::MB_Left )
+     {
+       mLMouseDown = false;
+       // after completed deformation steps, recalculate the lightmap
+       if (mDeform)
+         updateLightmap();
+     }
+
+     // Middle mouse button up
+     else if ( id == OIS::MB_Middle )
+     {
+       CEGUI::MouseCursor::getSingleton().show( );
+       mMMouseDown = false;
+     }
+
+     else if (id == OIS::MB_Right)
+     {
+       mRMouseDown = false;
+       // after completed deformation steps, recalculate the lightmap
+       if (mDeform)
+         updateLightmap();
+     }
+
+     return true;
+   }
+
+   virtual bool mouseMoved( const OIS::MouseEvent &arg )
+   {
+     // Update CEGUI with the mouse motion
+     CEGUI::System::getSingleton().injectMouseMove( arg.state.X.rel, arg.state.Y.rel );
+
+     // whenever the mouse is moved, we update the position on the
+     // terrain to which the mouse is currently pointing
+     Ray mouseRay = mCamera->getCameraToViewportRay(arg.state.X.abs/float(arg.state.width), arg.state.Y.abs/float(arg.state.height));
+     // since ETM is no longer a scene manager, we don't use a ray scene query,
+     // but instead query the terrain info directly
+     std::pair<bool, Vector3> result = mTerrainInfo->rayIntersects(mouseRay);
+     if (result.first)
+     {
+       // update pointer's position
+       mPointer->setPosition(result.second);
+     }
+
+     // If we are dragging the middle mouse button.
+     if ( mMMouseDown )
+     {
+       mCamera->yaw( Degree(-arg.state.X.rel * mRotateSpeed) );
+       mCamera->pitch( Degree(-arg.state.Y.rel * mRotateSpeed) );
+     }
+
+     return true;
+   }
+
+
+   virtual bool keyPressed(const OIS::KeyEvent& arg)
+   {
+     // we'll use the keys 1, 2, 3, 4 and E to switch between
+     // edit modes and select a paint texture
+     // WSAD is used for movement
+     // O will save the changes to disk
+     switch (arg.key)
+     {
+     case OIS::KC_1:
+       mDeform = false;
+       mChosenTexture = 0;
+       return true;
+     case OIS::KC_2:
+       mDeform = false;
+       mChosenTexture = 1;
+       return true;
+     case OIS::KC_3:
+       mDeform = false;
+       mChosenTexture = 2;
+       return true;
+     case OIS::KC_4:
+       mDeform = false;
+       mChosenTexture = 3;
+       return true;
+     case OIS::KC_5:
+       mDeform = false;
+       mChosenTexture = 4;
+       return true;
+     case OIS::KC_6:
+       mDeform = false;
+       mChosenTexture = 5;
+       return true;
+     case OIS::KC_E:
+       mDeform = true;
+       return true;
+
+     case OIS::KC_W:
+       mDirection.z += -1;
+       return true;
+     case OIS::KC_S:
+       mDirection.z += 1;
+       return true;
+     case OIS::KC_A:
+       mDirection.x += -1;
+       return true;
+     case OIS::KC_D:
+       mDirection.x += 1;
+       return true;
+
+     case OIS::KC_O:
+       saveTerrain();
+       return true;
+
+     case OIS::KC_P:
+       loadTerrain();
+       return true;
+
+     case OIS::KC_ESCAPE:
+       mContinue = false;
+       return true;
+
+     default:
+       return false;
+     }
+   }
+
+   virtual bool keyReleased(const OIS::KeyEvent& arg)
+   {
+     // not interested in this
+     switch (arg.key)
+     {
+     case OIS::KC_W:
+       mDirection.z -= -1;
+       return true;
+     case OIS::KC_S:
+       mDirection.z -= 1;
+       return true;
+     case OIS::KC_A:
+       mDirection.x -= -1;
+       return true;
+     case OIS::KC_D:
+       mDirection.x -= 1;
+       return true;
+
+     default:
+       return false;
+     }
+   }
+
+
+   void saveTerrain()
+   {
+     // just for demonstration, we'll save anything we can
+     // start with the terrain
+     Image image;
+     ET::saveHeightmapToImage(*mTerrainInfo, image);
+     image.save("../../Media/ET/ETterrain.png");
+
+     // now save the splatting maps
+     for (uint i = 0; i < mSplatMgr->getNumMaps(); ++i)
+     {
+       mSplatMgr->saveMapToImage(i, image);
+       image.save("../../Media/ET/ETcoverage."+StringConverter::toString(i)+".png");
+     }
+
+     // now the lightmap
+     Image lightmap;
+     ET::createTerrainLightmap(*mTerrainInfo, lightmap, 512, 512, Vector3(1, -1, 1), ColourValue(1,1,1),
+       ColourValue(0.3, 0.3,  0.3));
+     lightmap.save("../../Media/ET/ETlightmap.png");
+
+     // generate a base texture for this terrain (could be used for older hardware instead of splatting)
+     // create an ImageList of our splatting textures.
+     ET::ImageList textures (6);
+     for (int i = 0; i < 6; ++i)
+       textures[i].load("splatting"+StringConverter::toString(i)+".png", "ET");
+     // create the base texture
+     Image baseTexture;
+     mSplatMgr->createBaseTexture(baseTexture, 512, 512, textures, 20, 20);
+     baseTexture.save("../../Media/ET/ETbase.png");
+
+     // finally create a minimap using the lightmap and the generated base texture
+     Image minimap = ET::createMinimap(baseTexture, lightmap);
+     minimap.save("../../Media/ET/ETminimap.png");
+   }
+
+
+   void loadTerrain()
+   {
+     // now we revert the process and load the data back from disk
+     // recreate terrain...
+     mTerrainMgr->destroyTerrain();
+     Image image;
+     image.load("ETterrain.png", "ET");
+     ET::TerrainInfo info;
+     ET::loadHeightmapFromImage(info, image);
+
+	//--------------------------------------------------------------------
+	// todo 
+	 ET::TileTerrainInfo tileTerrainInfo;
+
+     info.setExtents(AxisAlignedBox(0, 0, 0, 1500, 300, 1500));
+     mTerrainMgr->createTerrain(info, tileTerrainInfo );
+     mTerrainInfo = & mTerrainMgr->getTerrainInfo();
+
+     // now load the splatting maps
+     for (uint i = 0; i < mSplatMgr->getNumMaps(); ++i)
+     {
+       image.load("ETcoverage."+StringConverter::toString(i)+".png", "ET");
+       mSplatMgr->loadMapFromImage(i, image);
+     }
+
+     // update the lightmap
+     updateLightmap();
+   }
+
+
+   void updateLightmap()
+   {
+     Image lightmap;
+     ET::createTerrainLightmap(*mTerrainInfo, lightmap, 192, 192, Vector3(1, -1, 1), ColourValue(1,1,1),
+       ColourValue(0.3, 0.3,  0.3));
+
+     // get our dynamic texture and update its contents
+     TexturePtr tex = TextureManager::getSingleton().getByName("ETLightmap");
+     tex->getBuffer(0, 0)->blitFromMemory(lightmap.getPixelBox(0, 0));
+   }
+
+
+protected:
+    RaySceneQuery *mRaySceneQuery;     // The ray scene query pointer
+    bool mLMouseDown, mRMouseDown;     // True if the mouse buttons are down
+    bool mMMouseDown;
+    SceneManager *mSceneMgr;           // A pointer to the scene manager
+    SceneNode *mPointer;               // Our "pointer" on the terrain
+    CEGUI::Renderer *mGUIRenderer;     // cegui renderer
+    ET::Brush mEditBrush;              // Brush for terrain editing
+    bool mDeform;                      // stores which mode we are in (deform or paint)
+    uint mChosenTexture;                // which of the four splatting textures is to be used?
+
+    // movement
+    Vector3 mDirection;
+    bool mMove;
+
+    SceneNode* mCamNode;
+
+    bool mContinue;
+
+    ET::TerrainManager* mTerrainMgr;
+    const ET::TerrainInfo* mTerrainInfo;
+    ET::SplattingManager* mSplatMgr;
+};
+
+
+class DemoETSM : public ExampleApplication
+{
+private:
+    ET::TerrainManager* mTerrainMgr;
+    ET::SplattingManager* mSplatMgr;
+protected:
+    CEGUI::OgreCEGUIRenderer *mGUIRenderer;
+    CEGUI::System *mGUISystem;         // cegui system
+public:
+    DemoETSM()
+    {
+      mTerrainMgr = 0;
+      mSplatMgr = 0;
+    }
+
+    ~DemoETSM()
+    {
+      delete mTerrainMgr;
+      delete mSplatMgr;
+    }
+protected:
+    void chooseSceneManager(void)
+    {
+      // Create instance of the Editable Terrain Scene Manager
+      mSceneMgr = mRoot->createSceneManager("OctreeSceneManager", "ETInstance");
+    }
+
+    void createScene(void)
+    {
+      mSceneMgr->setAmbientLight(ColourValue(0.5, 0.5, 0.5));
+      mSceneMgr->setSkyDome(true, "Examples/CloudySky", 5, 8);
+
+	  const int LAYER_TEXU_WIDTH = 1024;
+	  const int LAYER_TEXU_HEIGHT = 2048;
+	  const int LAYER_GRID_SIZE = 256;
+	  // 支持32张纹理拼贴，每张纹理最大256*256
+	  TexturePtr layer0 = TextureManager::getSingletonPtr()->createManual( 
+		  "<layer0>", "General",TEX_TYPE_2D,
+		  LAYER_TEXU_WIDTH,LAYER_TEXU_HEIGHT,1, PF_BYTE_RGBA );
+	   MaterialPtr material (MaterialManager::getSingleton().getByName("Terrain/TwoLayerLightmap"));
+	   material->getTechnique( 0 )->getPass(0)->getTextureUnitState(1)->setTextureName( "<layer0>");
+
+	  //TexturePtr layerlightmap = TextureManager::getSingletonPtr()->createManual( 
+		 // "<lightmap>", "General",TEX_TYPE_2D,512,512,1, PF_BYTE_RGBA );
+	  //Image ligthMapImage;
+	  //ligthMapImage.load( "shaolin.lightmap.png", "General");
+	
+	  //layerlightmap->getBuffer()->blitFromMemory( ligthMapImage.getPixelBox());
+
+     // create terrain manager
+      mTerrainMgr = new ET::TerrainManager(mSceneMgr);
+      mTerrainMgr->setLODErrorMargin(2, mCamera->getViewport()->getActualHeight());
+      mTerrainMgr->setUseLODMorphing(true, 0.2, "morphFactor");
+
+      // create a fresh, mid-high terrain for editing
+      ET::TerrainInfo terrainInfo (193, 193, vector<float>(193*193, 0.5f));
+      // set position and size of the terrain
+	  ET::TileTerrainInfo tileTerrainInfo;
+	  tileTerrainInfo.LoadTerrain( "shaolin.Terrain" );
+
+	  Ogre::Image image;
+	  image.load( "out1.png", "General");
+      loadHeightmapFromImage( terrainInfo,  image );
+	  terrainInfo.setExtents(AxisAlignedBox(0, 0, 0, 1500, 400, 1500));
+		
+	  // now render it
+      mTerrainMgr->createTerrain(terrainInfo, tileTerrainInfo );
+
+      // create the splatting manager
+      mSplatMgr = new ET::SplattingManager("ETSplatting", "ET", 192, 192, 3);
+      // specify number of splatting textures we need to handle
+      mSplatMgr->setNumTextures(6);
+
+      // create a manual lightmap texture
+      TexturePtr lightmapTex = TextureManager::getSingleton().createManual(
+        "ETLightmap", "ET", TEX_TYPE_2D, 192, 192, 1, PF_BYTE_RGB);
+      
+	  Image lightmap;
+      ET::createTerrainLightmap(terrainInfo, lightmap, 192, 192, Vector3(1, -1, 1), ColourValue::White,
+        ColourValue(0.3, 0.3, 0.3));
+      lightmapTex->getBuffer(0, 0)->blitFromMemory(lightmap.getPixelBox(0, 0));
+		
+	  //CreateTTLBLayer( "shaolin" );
+		//--------------------------------------------------------------------
+		//--------------------------------------------------------------------
+
+
+		//TexturePtr layer1 = TextureManager::getSingletonPtr()->createManual( 
+		//	"<layer1>","General", TEX_TYPE_2D, 192,192,1, PF_BYTE_RGBA );
+		
+		//
+		//image.load( "08大理/大理白玉石砖.tga" , "General");
+		//
+		//HardwarePixelBufferSharedPtr pixptr= layer1->getBuffer();
+		//pixptr->lock( HardwareBuffer::HBL_DISCARD );
+		//const PixelBox &pb = pixptr->getCurrentLock();
+		//uchar* data = static_cast<uchar*>( pb.data );
+		//size_t height = pb.getHeight();
+		//size_t width = pb.getWidth();
+		//size_t pitch = pb.rowPitch; // Skip between rows of image
+// 		uchar* data = new uchar[192*192*4];
+// 		memset( data, 200, 192*192*4 );
+		//for( int i = 0; i < 128; ++i )
+		//{
+		//	for( int j = 0; j < 128; ++j )
+		//	{
+		//		memcpy( data+i*4*pitch+j*4, image.getData()+i*3*128+j*3, 3 );
+		//		uchar t = data[i*4*pitch+j*4];
+		//		data[i*4*pitch+j*4] = data[i*4*pitch+j*4+2];
+		//		data[i*4*pitch+j*4+2] = t;
+		//		data[i*4*pitch+j*4+3] = 255;
+		//	}
+		//}
+		//pixptr->unlock();
+ 
+ 		//PixelBox pixelBox (192, 192, 1, PF_BYTE_RGBA, data );
+ 		//Image::Box imageBox (0, 0, 192, 192 );
+ 
+
+		//layer1->getBuffer(0,0)->blitFromMemory( lightmap.getPixelBox(0, 0) );
+
+		//layer0->getBuffer(0,0)->blitFromMemory( image.getPixelBox() );
+
+		// load the terrain material and assign it
+      //MaterialPtr material (MaterialManager::getSingleton().getByName("ETTerrainMaterial"));
+  //    MaterialPtr material (MaterialManager::getSingleton().getByName("Terrain/OneLayerLightmap"));
+	 // if( !material.isNull() )
+		//mTerrainMgr->setMaterial(material);
+	 // else 
+		//  assert(0);
+		//Technique* p = material->getTechnique(0);
+		//Pass* pass = p->getPass(0);
+		//TextureUnitState* pState = pass->getTextureUnitState(0);
+		//Ogre::String name = pState->getTextureName();
+		// Set camera look point
+    
+		SceneNode* camNode = mSceneMgr->getRootSceneNode()->createChildSceneNode();
+      camNode->setPosition( 750, 800, 800 );
+      camNode->attachObject(mCamera);
+      mCamera->lookAt( 750,0,750 );
+      mCamera->yaw( Degree(-45) );
+
+      // CEGUI setup
+      mGUIRenderer = new CEGUI::OgreCEGUIRenderer(mWindow, Ogre::RENDER_QUEUE_OVERLAY, false, 3000, mSceneMgr);
+      mGUISystem = new CEGUI::System(mGUIRenderer);
+      CEGUI::SchemeManager::getSingleton().loadScheme((CEGUI::utf8*)"TaharezLookSkin.scheme");
+      CEGUI::MouseCursor::getSingleton().setImage("TaharezLook", "MouseArrow");
+    }
+
+    void createFrameListener(void)
+    {
+      mFrameListener= new DemoListener(mWindow, mCamera, mSceneMgr, mGUIRenderer, mTerrainMgr, mSplatMgr);
+      mFrameListener->showDebugOverlay(true);
+      mRoot->addFrameListener(mFrameListener);
+    }
+
+};
+
+
+#if OGRE_PLATFORM == PLATFORM_WIN32 || OGRE_PLATFORM == OGRE_PLATFORM_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include "windows.h"
+
+INT WINAPI WinMain( HINSTANCE hInst, HINSTANCE, LPSTR strCmdLine, INT )
+#else
+int main(int argc, char **argv)
+#endif
+{
+    // Create application object
+    DemoETSM app;
+
+    try {
+        app.go();
+    } catch( Exception& e ) {
+#if OGRE_PLATFORM == OGRE_PLATFORM_WIN32
+        MessageBox( NULL, e.getFullDescription().c_str(), "An exception has occured!", MB_OK | MB_ICONERROR | MB_TASKMODAL);
+#else
+        fprintf(stderr, "An exception has occured: %s\n",
+                e.getFullDescription().c_str());
+#endif
+    }
+
+    return 0;
+}
+
+
